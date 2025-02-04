@@ -16,7 +16,6 @@ from tensorflow.keras.losses import Huber
 from tensorflow.keras.regularizers import l1_l2
 from kerastuner.tuners import RandomSearch
 import warnings
-
 warnings.filterwarnings("ignore")
 
 def remove_outliers(df, column='Close'):
@@ -31,12 +30,12 @@ def add_technical_indicators(data):
     try:
         if 'Close' not in data.columns:
             raise KeyError("Coluna 'Close' não encontrada nos dados originais")
-
         df = data.copy()
+        
         # Médias Móveis
         df['SMA_10'] = df['Close'].rolling(window=10).mean()
         df['SMA_50'] = df['Close'].rolling(window=50).mean()
-
+        
         # RSI
         delta = df['Close'].diff()
         gain = delta.where(delta > 0, 0)
@@ -45,38 +44,25 @@ def add_technical_indicators(data):
         avg_loss = loss.rolling(window=14).mean()
         rs = avg_gain / avg_loss
         df['RSI'] = 100 - (100 / (1 + rs))
-
-        # ATR
-        high_low = df['High'] - df['Low']
-        high_close = np.abs(df['High'] - df['Close'].shift())
-        low_close = np.abs(df['Low'] - df['Close'].shift())
-        df['TR'] = pd.concat([high_low, high_close, low_close], axis=1).max(axis=1)
-        df['ATR_14'] = df['TR'].rolling(window=14).mean()
-
+        
         # MACD
         df['EMA_12'] = df['Close'].ewm(span=12, adjust=False).mean()
         df['EMA_26'] = df['Close'].ewm(span=26, adjust=False).mean()
         df['MACD'] = df['EMA_12'] - df['EMA_26']
         df['MACD_Signal'] = df['MACD'].ewm(span=9, adjust=False).mean()
-
+        
         # Bollinger Bands
         df['BB_MA20'] = df['Close'].rolling(window=20).mean()
         df['BB_STD'] = df['Close'].rolling(window=20).std()
         df['BB_Upper'] = df['BB_MA20'] + (df['BB_STD'] * 2)
         df['BB_Lower'] = df['BB_MA20'] - (df['BB_STD'] * 2)
-
-        # VWAP
-        typical_price = (df['High'] + df['Low'] + df['Close']) / 3
-        cumulative_typical = (typical_price * df['Volume']).cumsum()
-        cumulative_volume = df['Volume'].cumsum()
-        df['VWAP'] = cumulative_typical / cumulative_volume
-
+        
         # Diferenciação
         df['Close_diff'] = df['Close'].diff()
-
+        
         # Remover colunas temporárias
-        df.drop(['TR', 'EMA_12', 'EMA_26'], axis=1, inplace=True, errors='ignore')
-
+        df.drop(['EMA_12', 'EMA_26'], axis=1, inplace=True, errors='ignore')
+        
         # Remover NaNs
         initial_count = len(df)
         df.dropna(inplace=True)
@@ -88,35 +74,36 @@ def add_technical_indicators(data):
 
 def build_lstm_model(hp, input_shape, forecast_horizon):
     input_layer = Input(shape=input_shape)
+    
     # Camada LSTM Bidirecional
     lstm_layer = Bidirectional(LSTM(
-        units=hp.Int('lstm_units', 32, 256, step=32),
+        units=hp.Int('lstm_units', 32, 128, step=32),
         return_sequences=True,
         kernel_regularizer=l1_l2(l1=1e-5, l2=1e-4)
     ))(input_layer)
     lstm_layer = BatchNormalization()(lstm_layer)
-    lstm_layer = Dropout(hp.Float('dropout', 0.1, 0.5, step=0.1))(lstm_layer)
-
+    lstm_layer = Dropout(hp.Float('dropout_lstm', 0.2, 0.5, step=0.1))(lstm_layer)
+    
     # Camada GRU
     gru_layer = GRU(
-        units=hp.Int('gru_units', 32, 128, step=32),
+        units=hp.Int('gru_units', 16, 64, step=16),
         return_sequences=False,
         kernel_regularizer=l1_l2(l1=1e-5, l2=1e-4)
     )(lstm_layer)
     gru_layer = BatchNormalization()(gru_layer)
-    gru_layer = Dropout(hp.Float('dropout', 0.1, 0.5, step=0.1))(gru_layer)
-
-    # Camadas Densas
+    gru_layer = Dropout(hp.Float('dropout_gru', 0.2, 0.5, step=0.1))(gru_layer)
+    
+    # Camada Densa
     dense_layer = Dense(
-        units=hp.Int('dense_units', 16, 128, step=16),
+        units=hp.Int('dense_units', 16, 64, step=16),
         activation='relu',
         kernel_regularizer=l1_l2(l1=1e-5, l2=1e-4)
     )(gru_layer)
     output_layer = Dense(forecast_horizon)(dense_layer)
-
+    
     model = Model(inputs=input_layer, outputs=output_layer)
     optimizer = Adam(
-        learning_rate=hp.Choice('learning_rate', [1e-4, 1e-3, 1e-2])
+        learning_rate=hp.Choice('learning_rate', [1e-4, 1e-3])
     )
     model.compile(
         optimizer=optimizer,
@@ -128,97 +115,96 @@ def build_lstm_model(hp, input_shape, forecast_horizon):
 def mean_absolute_percentage_error(y_true, y_pred):
     return np.mean(np.abs((y_true - y_pred) / y_true)) * 100
 
-def analyze_stock_with_lstm(stock_ticker, forecast_horizon=15, test_size=0.2):
+def analyze_stock_with_lstm(stock_ticker, forecast_horizon=10, test_size=0.2):
     try:
         # Download dos dados
         end_date = datetime.today().strftime('%Y-%m-%d')
-        start_date = (datetime.today() - timedelta(days=10 * 365)).strftime('%Y-%m-%d')
+        start_date = (datetime.today() - timedelta(days=5 * 365)).strftime('%Y-%m-%d')  # 5 anos de dados
         data = yf.download(stock_ticker, start=start_date, end=end_date)
-
         if data.empty or 'Close' not in data.columns:
             print(f"Erro: Nenhum dado válido encontrado para o ticker {stock_ticker}.")
             return
-
+        
         # Remover outliers
         data = remove_outliers(data)
-
+        
         # Processamento de indicadores
         processed_data = add_technical_indicators(data)
         if processed_data.empty:
             print("Erro: Dados processados estão vazios após remoção de NaNs")
             return
-
+        
         # Preparação de dados
         feature_columns = [col for col in processed_data.columns if col != 'Close']
         target_column = 'Close'
-
+        
         # Normalização robusta
         scaler = RobustScaler()
         scaled_features = scaler.fit_transform(processed_data[feature_columns])
         target_scaler = RobustScaler()
         scaled_target = target_scaler.fit_transform(processed_data[target_column].values.reshape(-1, 1))
-
+        
         # Seleção de features com RFE
-        selector = RFE(RandomForestRegressor(), n_features_to_select=min(10, len(feature_columns)))
+        selector = RFE(RandomForestRegressor(), n_features_to_select=min(5, len(feature_columns)))  # Menos features
         selected_features = selector.fit_transform(scaled_features, scaled_target)
-
+        
         # Preparar sequências temporais
         X, y = [], []
-        lookback = 30
+        lookback = 30  # Reduzido para 30 dias
         for i in range(lookback, len(processed_data) - forecast_horizon):
             X.append(selected_features[i - lookback:i])
             y.append(scaled_target[i:i + forecast_horizon])
         X, y = np.array(X), np.array(y)
-
+        
         # Divisão treino-teste temporal
         split = int(len(X) * (1 - test_size))
         X_train, X_test = X[:split], X[split:]
         y_train, y_test = y[:split], y[split:]
-
+        
         # Otimização de hiperparâmetros
         tuner = RandomSearch(
             lambda hp: build_lstm_model(hp, (X_train.shape[1], X_train.shape[2]), forecast_horizon),
             objective='val_loss',
-            max_trials=10,
+            max_trials=10,  # Reduzido para 10 tentativas
             executions_per_trial=1,
             directory='stock_tuning',
             project_name='stock_forecast_v2'
         )
         tuner.search(
             X_train, y_train,
-            epochs=50,
+            epochs=50,  # Reduzido para 50 épocas
             validation_data=(X_test, y_test),
             callbacks=[EarlyStopping(patience=10, restore_best_weights=True)],
             verbose=1
         )
-
+        
         # Treinamento final
         best_model = tuner.get_best_models(num_models=1)[0]
         history = best_model.fit(
             X_train, y_train,
-            epochs=100,
-            batch_size=32,
+            epochs=100,  # Reduzido para 100 épocas
+            batch_size=64,
             validation_data=(X_test, y_test),
             callbacks=[
-                EarlyStopping(patience=10, restore_best_weights=True),
+                EarlyStopping(patience=15, restore_best_weights=True),
                 ReduceLROnPlateau(factor=0.5, patience=5)
             ],
             verbose=1
         )
-
+        
         # Previsão
         last_data = selected_features[-lookback:]
         forecast = best_model.predict(last_data.reshape(1, lookback, -1))[0]
         forecast = target_scaler.inverse_transform(forecast.reshape(-1, 1)).flatten()
-
+        
         # Cálculo de métricas
         y_pred = best_model.predict(X_test)
         y_pred = target_scaler.inverse_transform(y_pred.reshape(-1, 1)).flatten()
         y_test_original = target_scaler.inverse_transform(y_test.reshape(-1, 1)).flatten()
-        rmse = np.sqrt(mean_squared_error(y_test_original, y_pred))
-        mae = mean_absolute_error(y_test_original, y_pred)
+        rmse = np.sqrt(mean_squared_error(y_test_original, y_pred)) / np.mean(y_test_original) * 100
+        mae = mean_absolute_error(y_test_original, y_pred) / np.mean(y_test_original) * 100
         mape = mean_absolute_percentage_error(y_test_original, y_pred)
-
+        
         # Resultados
         print("\n=== RESULTADOS ===")
         print(f"Ativo analisado: {stock_ticker}")
@@ -227,16 +213,16 @@ def analyze_stock_with_lstm(stock_ticker, forecast_horizon=15, test_size=0.2):
         print(f"Previsões para os próximos {forecast_horizon} dias:")
         for i, price in enumerate(forecast, 1):
             print(f"Dia {i}: {price:.2f} ({price - last_price:.2f})")
-        print(f"\nMétricas de Desempenho:")
-        print(f"- RMSE: {rmse:.2f}")
-        print(f"- MAE: {mae:.2f}")
-        print(f"- MAPE (%): {mape:.2f}%")
-
+        print(f"\nMétricas de Desempenho (%):")
+        print(f"- RMSE: {rmse:.2f}%")
+        print(f"- MAE: {mae:.2f}%")
+        print(f"- MAPE: {mape:.2f}%")
+        
         # Plot
         plt.figure(figsize=(12, 6))
         plt.plot(forecast, marker='o', linestyle='--', color='#2ecc71')
         plt.title(f'Previsão de Preços - {stock_ticker}\n'
-                  f"RMSE: {rmse:.2f} | MAE: {mae:.2f} | MAPE (%): {mape:.2f}%")
+                  f"RMSE: {rmse:.2f}% | MAE: {mae:.2f}% | MAPE: {mape:.2f}%")
         plt.xlabel('Dias Futuros')
         plt.ylabel('Preço (R$)')
         plt.grid(alpha=0.3)
