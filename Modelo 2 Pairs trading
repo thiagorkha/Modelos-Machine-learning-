@@ -1,16 +1,12 @@
-!pip install keras-tuner
 import numpy as np
 import pandas as pd
 import yfinance as yf
 import statsmodels.api as sm
-from statsmodels.tsa.stattools import adfuller, coint
 from sklearn.preprocessing import StandardScaler
-from sklearn.model_selection import train_test_split, TimeSeriesSplit
+from sklearn.model_selection import train_test_split
 from tensorflow.keras.models import Sequential
 from tensorflow.keras.layers import Dense
-from concurrent.futures import ProcessPoolExecutor
-import logging
-from datetime import datetime
+import matplotlib.pyplot as plt
 
 # Configurações iniciais
 IBOVESPA_TICKERS = [
@@ -27,31 +23,35 @@ IBOVESPA_TICKERS = [
     "VIVA3.SA", "WEGE3.SA", "YDUQ3.SA"
 ]
 
-START_DATE = '2018-01-01'
-END_DATE = datetime.today().strftime('%Y-%m-%d')  # Data final sempre será a data atual
+START_DATE = '2020-01-01'
+END_DATE = pd.Timestamp.today().strftime('%Y-%m-%d')  # Data atual
 TRAIN_TEST_SPLIT = 0.8  # Proporção de dados para treino
 Z_SCORE_THRESHOLD = 2.0  # Limite para divergência no spread
-MIN_COINTEGRATION_PVALUE = 0.1  # Limiar relaxado para testes
-MIN_DATA_POINTS = 252  # Mínimo de pontos de dados (aprox. 1 ano de negociação)
-MAX_PAIRS_TO_EVALUATE = 500  # Limitar o número de pares a serem avaliados
-
-# Configurar logging
-logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
 # Função para baixar dados históricos
 def download_data(tickers, start_date, end_date):
-    try:
-        data = yf.download(tickers, start=start_date, end=end_date)['Close']
-        if data.isnull().values.any():
-            logging.warning("Dados contêm valores nulos. Removendo ativos com dados incompletos...")
-            data = data.dropna(axis=1)
-        if data.empty or len(data) < MIN_DATA_POINTS:
-            raise ValueError("Dados insuficientes para análise.")
-        logging.info(f"Dados baixados com sucesso: {data.shape[1]} ativos e {data.shape[0]} dias.")
-        return data
-    except Exception as e:
-        logging.error(f"Erro ao baixar dados: {e}")
-        return None
+    data = yf.download(tickers, start=start_date, end=end_date)['Close']
+    return data.dropna()
+
+# Função para encontrar pares cointegrados
+def find_cointegrated_pairs(data):
+    n = data.shape[1]
+    score_matrix = np.zeros((n, n))
+    pvalue_matrix = np.ones((n, n))
+    keys = data.keys()
+    pairs = []
+    for i in range(n):
+        for j in range(i + 1, n):
+            S1 = data[keys[i]]
+            S2 = data[keys[j]]
+            result = sm.tsa.stattools.coint(S1, S2)
+            score = result[0]
+            pvalue = result[1]
+            score_matrix[i, j] = score
+            pvalue_matrix[i, j] = pvalue
+            if pvalue < 0.05:  # Significância estatística
+                pairs.append((keys[i], keys[j]))
+    return score_matrix, pvalue_matrix, pairs
 
 # Função para calcular o spread
 def calculate_spread(stock1, stock2):
@@ -59,61 +59,6 @@ def calculate_spread(stock1, stock2):
     hedge_ratio = model.params[0]
     spread = stock1 - hedge_ratio * stock2
     return spread, hedge_ratio
-
-# Função para verificar cointegração
-def check_cointegration(S1, S2):
-    try:
-        score, pvalue, _ = coint(S1, S2)
-        if pvalue < MIN_COINTEGRATION_PVALUE:
-            spread, _ = calculate_spread(S1, S2)
-            adf_test = adfuller(spread)
-            if adf_test[1] < MIN_COINTEGRATION_PVALUE:
-                return True, pvalue
-        return False, pvalue
-    except Exception as e:
-        logging.error(f"Erro ao testar cointegração: {e}")
-        return False, None
-
-# Função para processar um par (agora global)
-def process_pair(pair, data):
-    i, j = pair
-    keys = data.keys()
-    S1 = data[keys[i]]
-    S2 = data[keys[j]]
-    is_cointegrated, pvalue = check_cointegration(S1, S2)
-    if is_cointegrated:
-        logging.info(f"Par cointegrado encontrado: {keys[i]} e {keys[j]} (p-value: {pvalue:.4f})")
-        return (keys[i], keys[j], pvalue)
-    return None
-
-# Função auxiliar para mapear os pares
-def map_process_pair(pair, data):
-    return process_pair(pair, data)
-
-# Função para encontrar pares cointegrados (paralelizada)
-def find_cointegrated_pairs(data):
-    n = data.shape[1]
-    keys = data.keys()
-    pairs = []
-
-    # Pré-filtragem por correlação para reduzir o número de pares
-    corr_matrix = data.corr()
-    upper_tri = np.triu(corr_matrix, k=1)
-    top_pairs = np.dstack(np.unravel_index(np.argsort(-upper_tri.ravel()), upper_tri.shape))[0][:MAX_PAIRS_TO_EVALUATE]
-    logging.info(f"Pré-filtragem concluída: {len(top_pairs)} pares selecionados para avaliação.")
-
-    with ProcessPoolExecutor() as executor:
-        results = executor.map(map_process_pair, top_pairs, [data] * len(top_pairs))
-
-    for result in results:
-        if result:
-            pairs.append(result)
-
-    if not pairs:
-        logging.warning("Nenhum par cointegrado encontrado após a análise.")
-    else:
-        logging.info(f"{len(pairs)} pares cointegrados encontrados.")
-    return pairs
 
 # Função para normalizar o spread (z-score)
 def normalize_spread(spread):
@@ -125,81 +70,95 @@ def normalize_spread(spread):
 # Função principal
 def main():
     # Baixar dados históricos
-    logging.info("Baixando dados históricos...")
+    print("Baixando dados históricos...")
     data = download_data(IBOVESPA_TICKERS, START_DATE, END_DATE)
-    if data is None:
-        logging.error("Não foi possível obter dados históricos válidos.")
-        return
 
     # Encontrar pares cointegrados
-    logging.info("Encontrando pares cointegrados...")
-    pairs = find_cointegrated_pairs(data)
+    print("Encontrando pares cointegrados...")
+    _, _, pairs = find_cointegrated_pairs(data)
     if not pairs:
-        logging.warning("Nenhum par cointegrado encontrado. Encerrando execução.")
+        print("Nenhum par cointegrado encontrado.")
         return
 
-    # Selecionar o primeiro par para análise
-    stock1_ticker, stock2_ticker, _ = pairs[0]
-    stock1 = data[stock1_ticker]
-    stock2 = data[stock2_ticker]
+    print(f"Pares cointegrados encontrados: {pairs}")
 
-    # Calcular o spread
-    logging.info("Calculando spread...")
-    spread, hedge_ratio = calculate_spread(stock1, stock2)
-    z_scores = normalize_spread(spread)
+    # Avaliar cada par cointegrado
+    for stock1_ticker, stock2_ticker in pairs:
+        stock1 = data[stock1_ticker]
+        stock2 = data[stock2_ticker]
 
-    # Dividir dados em treino e teste
-    X = z_scores.values.reshape(-1, 1)
-    y = np.where(z_scores > Z_SCORE_THRESHOLD, -1, np.where(z_scores < -Z_SCORE_THRESHOLD, 1, 0))
-    X_train, X_test, y_train, y_test = train_test_split(X, y, train_size=TRAIN_TEST_SPLIT, shuffle=False)
+        # Calcular o spread
+        print(f"\nAnalisando par: {stock1_ticker} e {stock2_ticker}")
+        spread, hedge_ratio = calculate_spread(stock1, stock2)
+        z_scores = normalize_spread(spread)
 
-    # Treinar a rede neural
-    logging.info("Treinando rede neural...")
-    model = Sequential([
-        Dense(32, activation='relu', input_shape=(X_train.shape[1],)),
-        Dense(16, activation='relu'),
-        Dense(1, activation='linear')
-    ])
-    model.compile(optimizer='adam', loss='mse')
-    model.fit(X_train, y_train, epochs=20, batch_size=64, verbose=0)
+        # Dividir dados em treino e teste
+        X = z_scores.values.reshape(-1, 1)
+        y = np.where(z_scores > Z_SCORE_THRESHOLD, -1, np.where(z_scores < -Z_SCORE_THRESHOLD, 1, 0))
+        X_train, X_test, y_train, y_test = train_test_split(X, y, train_size=TRAIN_TEST_SPLIT, shuffle=False)
 
-    # Avaliar o modelo
-    test_predictions = model.predict(X_test)
-    test_predictions = np.where(test_predictions > 0.5, 1, np.where(test_predictions < -0.5, -1, 0))
+        # Treinar a rede neural
+        print("Treinando rede neural...")
+        model = Sequential([
+            Dense(64, activation='relu', input_shape=(X_train.shape[1],)),
+            Dense(32, activation='relu'),
+            Dense(1, activation='linear')
+        ])
+        model.compile(optimizer='adam', loss='mse')
+        model.fit(X_train, y_train, epochs=50, batch_size=32, verbose=0)
 
-    # Gerar sinais de trading
-    last_z_score = z_scores.iloc[-1]
-    signal = None
-    if last_z_score > Z_SCORE_THRESHOLD:
-        signal = "SELL"
-    elif last_z_score < -Z_SCORE_THRESHOLD:
-        signal = "BUY"
+        # Avaliar o modelo
+        test_predictions = model.predict(X_test)
+        test_predictions = np.where(test_predictions > 0.5, 1, np.where(test_predictions < -0.5, -1, 0))
 
-    # Recomendações de compra e venda
-    if signal == "BUY":
-        logging.info(f"Recomendação: COMPRAR {stock1_ticker} e VENDER {stock2_ticker}")
-        capital = 10000  # Capital disponível para investimento
-        price_stock1 = stock1.iloc[-1]
-        price_stock2 = stock2.iloc[-1]
-        qty_stock1 = int(capital / price_stock1)
-        qty_stock2 = int(qty_stock1 * hedge_ratio)
-        total_cost_stock1 = qty_stock1 * price_stock1
-        total_cost_stock2 = qty_stock2 * price_stock2
-        logging.info(f"Comprar {qty_stock1} ações de {stock1_ticker} por R${price_stock1:.2f} cada (Total: R${total_cost_stock1:.2f})")
-        logging.info(f"Vender {qty_stock2} ações de {stock2_ticker} por R${price_stock2:.2f} cada (Total: R${total_cost_stock2:.2f})")
-    elif signal == "SELL":
-        logging.info(f"Recomendação: VENDER {stock1_ticker} e COMPRAR {stock2_ticker}")
-        capital = 10000  # Capital disponível para investimento
-        price_stock1 = stock1.iloc[-1]
-        price_stock2 = stock2.iloc[-1]
-        qty_stock1 = int(capital / price_stock1)
-        qty_stock2 = int(qty_stock1 * hedge_ratio)
-        total_cost_stock1 = qty_stock1 * price_stock1
-        total_cost_stock2 = qty_stock2 * price_stock2
-        logging.info(f"Vender {qty_stock1} ações de {stock1_ticker} por R${price_stock1:.2f} cada (Total: R${total_cost_stock1:.2f})")
-        logging.info(f"Comprar {qty_stock2} ações de {stock2_ticker} por R${price_stock2:.2f} cada (Total: R${total_cost_stock2:.2f})")
-    else:
-        logging.info("Nenhuma recomendação de trading no momento.")
+        # Gerar sinais de trading
+        last_z_score = z_scores.iloc[-1]
+        signal = None
+        if last_z_score > Z_SCORE_THRESHOLD:
+            signal = "SELL"
+        elif last_z_score < -Z_SCORE_THRESHOLD:
+            signal = "BUY"
+
+        # Recomendações de compra e venda
+        if signal == "BUY":
+            print(f"Recomendação: COMPRAR {stock1_ticker} e VENDER {stock2_ticker}")
+            capital = 10000  # Capital disponível para investimento
+            price_stock1 = stock1.iloc[-1]
+            price_stock2 = stock2.iloc[-1]
+            qty_stock1 = int(capital / price_stock1)
+            qty_stock2 = int(qty_stock1 * hedge_ratio)
+            total_cost_stock1 = qty_stock1 * price_stock1
+            total_cost_stock2 = qty_stock2 * price_stock2
+            print(f"Comprar {qty_stock1} ações de {stock1_ticker} por R${price_stock1:.2f} cada (Total: R${total_cost_stock1:.2f})")
+            print(f"Vender {qty_stock2} ações de {stock2_ticker} por R${price_stock2:.2f} cada (Total: R${total_cost_stock2:.2f})")
+        elif signal == "SELL":
+            print(f"Recomendação: VENDER {stock1_ticker} e COMPRAR {stock2_ticker}")
+            capital = 10000  # Capital disponível para investimento
+            price_stock1 = stock1.iloc[-1]
+            price_stock2 = stock2.iloc[-1]
+            qty_stock1 = int(capital / price_stock1)
+            qty_stock2 = int(qty_stock1 * hedge_ratio)
+            total_cost_stock1 = qty_stock1 * price_stock1
+            total_cost_stock2 = qty_stock2 * price_stock2
+            print(f"Vender {qty_stock1} ações de {stock1_ticker} por R${price_stock1:.2f} cada (Total: R${total_cost_stock1:.2f})")
+            print(f"Comprar {qty_stock2} ações de {stock2_ticker} por R${price_stock2:.2f} cada (Total: R${total_cost_stock2:.2f})")
+        else:
+            print("Nenhuma recomendação de trading no momento.")
+            continue  # Pula para o próximo par se não houver recomendação
+
+        # Plotar o spread e os sinais de trading (apenas para pares com recomendação)
+        z_scores_filtered = z_scores.loc[START_DATE:END_DATE]  # Limita o intervalo de datas
+        plt.figure(figsize=(12, 6))
+        plt.plot(z_scores_filtered, label="Z-Score do Spread", color="blue")
+        plt.axhline(Z_SCORE_THRESHOLD, color="red", linestyle="--", label="Limite Superior")
+        plt.axhline(-Z_SCORE_THRESHOLD, color="green", linestyle="--", label="Limite Inferior")
+        #plt.scatter(len(z_scores_filtered) - 1, last_z_score, color="orange", s=100, label="Último Z-Score")
+        plt.title(f"Spread Normalizado para {stock1_ticker} e {stock2_ticker} ({START_DATE} até {END_DATE})")
+        plt.xlabel("Data")
+        plt.ylabel("Z-Score")
+        plt.legend()
+        plt.tight_layout()
+        plt.show()
 
 if __name__ == "__main__":
     main()
